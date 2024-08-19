@@ -1,0 +1,35 @@
+{
+    "LanguageModel": {
+        "input": {
+            "vocab_size": 51200,
+            "tie_embeddings": false,
+            "pad_vocab_size_multiple": 8
+        }
+    },
+    "MixerModel": {
+        "input": {
+            "d_model": 2048,
+            "n_layer": 24,
+            "lm_head_prenorm": "layer"
+        }
+    },
+    "Block1": {
+        "n_layers": 24,
+        "BlockType": "phi_block",
+        "block_input": {
+            "residual_in_fp32": true,
+            "resid_dropout": 0.0
+        },
+        "CoreType": "DiscreteMamba2",
+        "core_input": {
+            "d_state": 64,
+            "nheads": 32,
+            "expand": 1,
+            "chunk_size": 128,
+            "activation": "identity",
+            "use_ref_impl": false,
+            "bias": false,
+            "norm_cls": "none"
+        }
+    }
+}
