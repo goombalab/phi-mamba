@@ -20,7 +20,7 @@
             "residual_in_fp32": true,
             "resid_dropout": 0.0
         },
-        "CoreType": "DiscreteMamba2",
+        "CoreType": "discrete_mamba2",
         "core_input": {
             "d_state": 64,
             "nheads": 32,

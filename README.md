@@ -3,12 +3,12 @@
 ![Phi-Mamba](assets/phi-mamba.png "MOHAWK Stages")
 > **Transformers to SSMs: Distilling Quadratic Knowledge to Subquadratic Models**\
 > Aviv Bick*, Kevin Y. Li*, Eric P. Xing, J. Zico Kolter, Albert Gu \
-> Paper: TBD \
-> Blogpost: TBD
+> Paper: https://arxiv.org/abs/2408.10189 \
+> Blogpost: https://goombalab.github.io/blog/2024/distillation-part1-mohawk/
 
 ## About
 
-Phi-Mamba is a subquadratic, Mamba-based model distilled from Phi-1.5 using the MOHAWK method with only 3B tokens. MOHAWK allows cross-architectural distillation from Transformers by viewing attention and, in this case, SSMs as sequence transformations that can be aligned. MOHAWK consists of three stages which gradually increase the scope of distillation: starting from each layer's matrix mixer, then to the hidden state of each layer, and finally the entire model. 
+Phi-Mamba is a subquadratic, Mamba-based model distilled from Phi-1.5 using the MOHAWK method with only 3B tokens. MOHAWK allows cross-architectural distillation from Transformers by viewing Attention and, in this case, SSMs as sequence transformations that can be aligned. MOHAWK consists of three stages which gradually increase the scope of distillation: starting from each layer's matrix mixer, then to the hidden state of each layer, and finally the entire model. 
 
 ## Installation
 Installation instructions are heavily inspired by the original [state-spaces/mamba](https://github.com/state-spaces/mamba) repo. Note, `torch>=2.3` has seemed to give issues with the package, so please use `torch==2.2` for now
@@ -123,10 +123,10 @@ python lm_harness_eval.py --model phi-mamba --tasks lambada_openai,hellaswag,piq
 ## Citation
 If you use this codebase, or otherwise find our work valuable, please cite Phi-Mamba:
 ```
-@article{distill-ssm,
+@article{distill-mohawk,
   title={Transformers to SSMs: Distilling Quadratic Knowledge to Subquadratic Models},
   author={Bick, Aviv and Li, Kevin Y. and Xing, Eric P. and Kolter, J. Zico and Gu, Albert},
-  journal={arXiv preprint arXiv:TBD},
+  journal={arXiv preprint arXiv:2408.10189},
   year={2024}
 }
 ```
