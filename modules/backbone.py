@@ -23,7 +23,7 @@ class MixerModel(nn.Module):
         self.layers = nn.ModuleList()
         for block_cfg in blocks:
             n_layers = block_cfg.n_layers
-            Block = import_module(f"modules.{block_cfg.BlockType}").Block
+            Block = import_module(block_cfg.BlockType).Block
             layers = nn.ModuleList(
                 [
                     Block(

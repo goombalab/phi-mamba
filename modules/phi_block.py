@@ -27,11 +27,10 @@ class Block(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.config = config
-        self.residual_in_fp32 = config.block_input.residual_in_fp32
         self.layer_idx = layer_idx
 
         # Mixer
-        MixerClass = import_module(f"modules.mixers.{config.CoreType}").Mixer
+        MixerClass = import_module(config.CoreType).Mixer
         self.mixer = MixerClass(
             d_model=self.d_model,
             layer_idx=layer_idx,
