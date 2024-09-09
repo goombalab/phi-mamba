@@ -15,7 +15,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prompt", type=str, default=None)
+    parser.add_argument("--prompt", type=str, default="The quick brown fox jumps over the lazy dog.")
     parser.add_argument("--promptlen", type=int, default=100)
     parser.add_argument(
         "--model",
@@ -100,7 +100,7 @@ def main():
     model.to(device=device)
     model.eval()
     print(
-        f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
+        f"Number of parameters: {sum(p.numel() for p in model.parameters())}"
     )
 
     # Tokenize prompt
@@ -150,8 +150,13 @@ def main():
         )
 
     if args.prompt is not None:
-        print(f"\nGenerated text:\n")
-        print(tokenizer.batch_decode(out.sequences.tolist())[0])
+        print(
+            "Generated text:\n",
+            tokenizer.batch_decode(
+                sequences=out.sequences.tolist(), 
+                skip_special_tokens=True
+            )[0],
+        )
 
     time_bench(args, input_ids, generate_fn)
 
