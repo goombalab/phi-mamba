@@ -42,16 +42,13 @@ class Mixer(nn.Module):
         if inference_params is not None:
             self._check_states_from_cache(inference_params=inference_params)
 
-        result = self.self_attn(
+        attn_output, attn_weights, past_key_value = self.self_attn(
             hidden_states,
             attention_mask=attention_mask,
             output_attentions=return_mixer_matrix,
             past_key_value=inference_params,
             position_ids=position_ids.to(torch.long) if position_ids is not None else None,
         )
-        # print(inference_params.seqlen_offset)
-        # input()
-        attn_output, attn_weights, past_key_value = result
 
         return {"hidden_states": attn_output, "transfer_matrix": attn_weights}
 
