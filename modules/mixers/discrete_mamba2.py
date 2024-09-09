@@ -3,44 +3,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from nn.activation import Activation
-
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
 
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
+from modules.mixers.discrete_mamba2_ref import materialize_mixer
+
 try:
-    from ops.triton.layernorm import RMSNorm
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 except ImportError:
-    RMSNorm = None
-
-from modules.mixers.discrete_mamba2_ref_impl import (
-    ssd_minimal_discrete,
-    to_transfer_matrix_ssd,
-)
-from ops.triton.flashmamba import mamba_chunk_scan_fused
-
+    selective_state_update = None
+from einops import repeat
 
 class Mixer(nn.Module):
     def __init__(
         self,
         d_model,
         d_state=64,
-        nheads=32,
+        n_qk_heads=32,
+        n_v_heads=32,
         d_conv=4,
         expand=1,
-        norm_cls="rms",
-        activation="swish",
+        activation="identity",
         bias=False,
         conv_bias=True,
-        # Fused kernel and sharding options
         chunk_size=128,
-        use_ref_impl=False,
-        layer_idx=None,  # Absorb kwarg for general module
+        layer_idx=None,
         device=None,
         dtype=None,
-        **kwargs,
+        **kwargs, # Absorb kwarg for general module
     ):
         """
         See the class .kernel.SSKernel for the kernel constructor which accepts kernel_args.
@@ -55,14 +49,14 @@ class Mixer(nn.Module):
         self.d_conv = d_conv
         self.expand = expand
         self.d_inner = self.expand * self.d_model
-        self.nheads = nheads
-        self.headdim = self.d_inner // self.nheads
-        assert self.nheads == self.d_inner // self.headdim
+        self.n_qk_heads = n_qk_heads
+        self.n_v_heads = n_v_heads
+        self.headdim = self.d_inner // self.n_v_heads
+        assert self.n_v_heads == self.d_inner // self.headdim
         assert self.d_inner % self.headdim == 0
-        self.norm_cls = norm_cls
+        assert self.n_v_heads % self.n_qk_heads == 0
         self.activation = activation
         self.chunk_size = chunk_size
-        self.use_ref_impl = use_ref_impl
         self.layer_idx = layer_idx
         self.bias = bias
         self.kwargs = kwargs
@@ -70,7 +64,7 @@ class Mixer(nn.Module):
         # Projections
         self.in_proj = nn.Linear(
             self.d_model,
-            2 * self.d_inner + self.nheads * self.d_state * 2 + self.nheads,
+            2 * self.d_inner + 2 * self.n_qk_heads * self.d_state + self.n_v_heads,
             bias=bias,
             **factory_kwargs,
         )
@@ -79,7 +73,7 @@ class Mixer(nn.Module):
         )  # make sure z_bias always exists
 
         # Convolutional layer
-        conv_dim = self.d_inner + self.nheads * self.d_state * 2
+        conv_dim = self.d_inner + 2 * self.n_qk_heads * self.d_state
         self.conv_bias = conv_bias
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim,
@@ -92,22 +86,16 @@ class Mixer(nn.Module):
         )
 
         # Activation after conv
-        self.act = Activation(self.activation)
+        if self.activation == "identity":
+            self.act = nn.Identity()
+        elif self.activation in ["silu", "swish"]:
+            self.act = nn.SiLU()
+        else:
+            raise ValueError(f"Unknown activation {self.activation}")
 
         # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads, device=device))
+        self.D = nn.Parameter(torch.ones(self.n_v_heads, device=device))
         self.D._optim = {"weight_decay": 0.0}
-
-        # Norm before out_proj
-        if self.norm_cls in ["rms", "rmsnorm"]:
-            assert RMSNorm is not None
-            self.norm = RMSNorm(self.d_inner, eps=1e-5, **factory_kwargs)
-        elif self.norm_cls in ["layer", "layernorm"]:
-            self.norm = nn.LayerNorm(self.d_inner, eps=1e-5, **factory_kwargs)
-        elif self.norm_cls in ["none", "identity"]:
-            self.norm = nn.Identity()
-        else:
-            raise ValueError(f"Unknown norm class {self.norm_cls}")
 
         # out_proj
         self.out_proj = nn.Linear(
@@ -150,14 +138,13 @@ class Mixer(nn.Module):
         xBCzA_log = self.in_proj(u)
         xBC, z, A_log = torch.split(
             xBCzA_log,
-            [self.d_inner + self.nheads * self.d_state * 2, self.d_inner, self.nheads],
+            [
+                self.d_inner + 2 * self.n_qk_heads * self.d_state,
+                self.d_inner,
+                self.n_v_heads,
+            ],
             dim=-1,
         )
-        z = z + self.z_bias
-
-        A_log = -F.softplus(A_log).to(
-            dtype=xBC.dtype
-        )  # F.softplus(torch.tensor([0.5413]))=1
 
         if state is not None:
             # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
@@ -172,152 +159,105 @@ class Mixer(nn.Module):
 
         x, B, C = torch.split(
             xBC,
-            [self.d_inner, self.nheads * self.d_state, self.nheads * self.d_state],
+            [
+                self.d_inner,
+                self.n_qk_heads * self.d_state,
+                self.n_qk_heads * self.d_state,
+            ],
             dim=-1,
         )
-        B, C = [rearrange(M, "b l (h n) -> b l h n", h=self.nheads) for M in (B, C)]
 
-        # SSM
-        y, ssm_state, T = self.ssm_forward(
-            x, A_log, B, C, self.D, chunk_size, state, return_mixer_matrix
+        x = rearrange(x, "b l (h n) -> b l h n", h=self.n_v_heads)
+        B = rearrange(B, "b l (h n) -> b l h n", h=self.n_qk_heads)
+        C = rearrange(C, "b l (h n) -> b l h n", h=self.n_qk_heads)
+
+        # SSM forward
+        result = mamba_chunk_scan_combined(
+            x=x / F.softplus(A_log).to(x.dtype).unsqueeze(-1),
+            dt=A_log,
+            dt_softplus=True,
+            A=-torch.ones(self.n_v_heads, device=A_log.device),
+            B=B,
+            C=C,
+            chunk_size=chunk_size,
+            # initial_states=(state["ssm"] if state is not None else None), # currently not supported by mamba_ssm.utils.generation
+            return_final_states=(state is not None),
         )
+
         if state is not None:
+            y, ssm_state = result
             state["ssm"].copy_(ssm_state)
+        else:
+            y = result
+
+        Du = torch.einsum("h,blhp->blhp", self.D, x)
+        y = rearrange(y + Du, "b l h p -> b l (h p)")
 
         # Norm and gate
-        y = (
-            self.norm(y, z)
-            if self.norm_cls in ["rms", "rmsnorm"]
-            else self.norm(y) * F.silu(z)
-        )
+        out = self.out_proj(y * F.silu(z + self.z_bias))
+        outputs["hidden_states"] = out[:, :seqlen, :]
 
-        # Out proj
-        out = self.out_proj(y)
-        out = out[:, :seqlen, :]
-
-        # store outputs
-        outputs["hidden_states"] = out
         if return_mixer_matrix:
-            outputs["transfer_matrix"] = T
+            outputs["transfer_matrix"] = materialize_mixer(
+                A_log=A_log, B=B, C=C, D=self.D
+                )
         return outputs
 
     def step(self, u, state, **kwargs):
-        # x: (B D)
-        u = u.squeeze(1)
+        """
+        u: (B D)
+        state: dict of states
+        Returns: same shape as u
+        """
 
         # Project input
-        xBCzA_log = self.in_proj(u)
+        xBCzA_log = self.in_proj(u.squeeze(1))
         xBC, z, A_log = torch.split(
             xBCzA_log,
-            [self.d_inner + self.nheads * self.d_state * 2, self.d_inner, self.nheads],
+            [
+                self.d_inner + 2 * self.n_qk_heads * self.d_state,
+                self.d_inner,
+                self.n_v_heads,
+            ],
             dim=-1,
         )
-        z = z + self.z_bias
-
-        A_log = -F.softplus(A_log).to(dtype=A_log.dtype)
 
         xBC, conv_state = self.convolutional_step(xBC, state["conv"])
+        state["conv"].copy_(conv_state) # update state in place
 
         x, B, C = torch.split(
             xBC,
-            [self.d_inner, self.nheads * self.d_state, self.nheads * self.d_state],
+            [
+                self.d_inner,
+                self.n_qk_heads * self.d_state,
+                self.n_qk_heads * self.d_state,
+            ],
             dim=-1,
         )
-        x, B, C = [
-            rearrange(M, "b (h s) -> b h s", h=self.nheads) for M in (x, B, C)
-        ]  # s is headdim for x and d_state for B and C
 
-        y, ssm_state = self.ssm_step(
-            X=x, A_log=A_log, B=B, C=C, initial_states=state["ssm"].to(x.dtype)
+        x = rearrange(x, "b (h s) -> b h s", h=self.n_v_heads)
+        B = rearrange(B, "b (h s) -> b h s", h=self.n_qk_heads)
+        C = rearrange(C, "b (h s) -> b h s", h=self.n_qk_heads)
+
+        state["ssm"] = state["ssm"].to(x.dtype)
+        ones = torch.ones((self.n_v_heads, self.headdim, self.d_state), device=A_log.device).to(dtype=x.dtype)
+        y = selective_state_update(
+            x=x/F.softplus(A_log).to(x.dtype).unsqueeze(-1),
+            dt=repeat(A_log, "b h -> b h p", p=self.headdim),
+            dt_softplus=True,
+            A=-ones,
+            B=B,
+            C=C,
+            state=state["ssm"], # will be updated in place
         )
 
         y = y + self.D[:, None] * x
         y = rearrange(y, "b h p -> b (h p)")
 
         # Norm and gate
-        y = (
-            self.norm(y, z)
-            if self.norm_cls in ["rms", "rmsnorm"]
-            else self.norm(y) * F.silu(z)
-        )
-        out = self.out_proj(y)
+        out = self.out_proj(y * F.silu(z + self.z_bias))
 
-        # update state in place
-        state["ssm"].copy_(ssm_state)
-        state["conv"].copy_(conv_state)
-        return out, {"conv": conv_state, "ssm": ssm_state}
-
-    def ssm_forward(
-        self, x, A_log, B, C, D, chunk_size, state, return_mixer_matrix=False
-    ):
-        """
-        Arguments:
-            x: (batch, seqlen, nheads, headdim)
-            A_log: (batch, seqlen, nheads)
-            B: (batch, seqlen, nheads, dstate)
-            C: (batch, seqlen, nheads, dstate)
-            D: (nheads)
-
-        Return:
-            y: (batch, seqlen, nheads, headdim)
-            T: (batch, nheads, seqlen, seqlen)
-        """
-        if return_mixer_matrix:
-            # Since the transfer matrix will be equated to the attention matrix,
-            # we need to support the form: torch.matmul(attn_weights, value_states)
-            T = to_transfer_matrix_ssd(A_log=A_log, B=B, C=C, D=D)
-            T = rearrange(T, "b h z l -> b h l z")
-            X = rearrange(x, "b l (h p) -> b h l p", h=self.nheads, p=self.headdim)
-            y = torch.matmul(T, X)
-            y = rearrange(y, "b h l p -> b l (h p)")
-            return y, None, T
-
-        X = rearrange(x, "b l (h p) -> b l h p", h=self.nheads, p=self.headdim)
-        if self.use_ref_impl:
-            y, ssm_state = ssd_minimal_discrete(
-                X=X,
-                A_log=A_log,
-                B=B,
-                C=C,
-                block_len=chunk_size,
-                initial_states=state["ssm"].to(X.dtype),
-            )
-        else:
-            # This is a hacky way to use previous implementation without dt
-            y, ssm_state = mamba_chunk_scan_fused(
-                x=X / A_log.unsqueeze(-1),
-                dt=rearrange(A_log, "b (c l) h -> b h c l", l=chunk_size),
-                A=torch.ones(self.nheads, device=A_log.device),
-                B=B,
-                C=C,
-                D=None,
-                z=None,
-            )
-            ssm_state = ssm_state[:, -1]
-        Du = torch.einsum("h,blhp->blhp", D, X)
-        y = rearrange(y + Du, "b l h p -> b l (h p)")
-
-        return y, ssm_state, None
-
-    def ssm_step(self, X, A_log, B, C, initial_states=None):
-        """
-        Arguments:
-            X: (batch, n_heads, d_head)
-            A_log: (batch, n_heads)
-            B: (batch, n_heads, d_state)
-            C: (batch, n_heads, d_state)
-            initial_states: (batch, n_heads, d_state, d_state) or None
-        Return:
-            Y: (batch, n_heads, d_head)
-            final_state: (batch, n_heads, d_head, d_state)
-        """
-        # Compute Y:
-        Bx = torch.einsum("bhn,bhp->bhpn", B, X)  # Bx
-        Ah = torch.einsum("bh,bhpn->bhpn", torch.exp(A_log), initial_states)
-        final_state = Ah + Bx
-        Y = torch.einsum("bhn,bhpn->bhp", C, final_state)
-
-        return Y, final_state
+        return out, state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.in_proj.weight.device
@@ -334,7 +274,7 @@ class Mixer(nn.Module):
         ssm_dtype = self.in_proj.weight.dtype if dtype is None else dtype
         ssm_state = torch.zeros(
             batch_size,
-            self.nheads,
+            self.n_v_heads,
             self.headdim,
             self.d_state,
             device=device,
@@ -347,7 +287,7 @@ class Mixer(nn.Module):
     ):
         """
         conv_state: (batch, d_conv, conv1d.weight.shape[0])
-        ssm_state: (batch, nheads, headdim, d_state)
+        ssm_state: (batch, n_qk_heads, headdim, d_state)
         """
         assert self.layer_idx is not None
         # Allocate memory if not exists

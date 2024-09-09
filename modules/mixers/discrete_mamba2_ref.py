@@ -18,7 +18,6 @@ def segsum(x):
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
 
-
 def ssd_minimal_discrete(X, A_log, B, C, block_len, initial_states=None):
     """
     Arguments:
@@ -78,9 +77,43 @@ def ssd_minimal_discrete(X, A_log, B, C, block_len, initial_states=None):
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
     return Y, final_state
 
-
-def to_transfer_matrix_ssd(A_log, B, C, D):
+def step(x, B, C, A_log, state):
     """
+    Arguments:
+        x: (batch, n_v_heads, dim)
+        B: (batch, n_qk_heads, d_state)
+        C: (batch, n_qk_heads, d_state)
+        A_log: (batch, length, n_heads)
+        state: dict
+    Return:
+        y: (batch, n_v_heads, dim)
+        ssm_state: (batch, n_v_heads, d_state)
+    """
+    n_v_heads = x.shape[1]
+    n_qk_heads = B.shape[1]
+    assert n_v_heads % n_qk_heads == 0
+    
+
+    # Broadcast B and C across the head dimension (n_v_heads % n_qk_heads == 0)
+    B = B.repeat_interleave(n_v_heads // n_qk_heads, dim=1)
+    C = C.repeat_interleave(n_v_heads // n_qk_heads, dim=1)
+
+    # SSM step
+    Bx = torch.einsum("bhn,bhp->bhpn", B, x)
+    Ah = torch.einsum(
+        "bh,bhpn->bhpn",
+        torch.sigmoid(-A_log).to(x.dtype),  # = torch.exp(-F.softplus(A_log))
+        state["ssm"].to(x.dtype),
+    )
+    ssm_state = Ah + Bx
+    y = torch.einsum("bhn,bhpn->bhp", C, ssm_state)
+    return y, ssm_state
+
+def materialize_mixer(A_log, B, C, D):
+    """
+    Since the transfer matrix will be equated to the attention matrix,
+    we need to support the form: torch.matmul(attn_weights, value_states).
+    Thus, y = torch.matmul(T, X)
     Arguments:
         A_log: (batch, length, n_heads)
         B: (batch, length, n_heads, d_state)
@@ -91,11 +124,15 @@ def to_transfer_matrix_ssd(A_log, B, C, D):
     batch_size, length, n_heads, d_state = B.shape
     assert A_log.shape == (batch_size, length, n_heads)
     assert B.shape == C.shape == (batch_size, length, n_heads, d_state)
+
     # Compute:
     A_log = rearrange(A_log, "b l h -> b h l")
     powers = torch.exp(segsum(A_log))
     T = torch.einsum("blhn,bshn,bhls->bhsl", C, B, powers)
+
     # Add D:
     if D is not None:
         T[:, :, torch.arange(length), torch.arange(length)] += D.view(1, n_heads, 1)
+
+    T = rearrange(T, "b h z l -> b h l z")
     return T
