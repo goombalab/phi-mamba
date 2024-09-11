@@ -240,6 +240,7 @@ class Mixer(nn.Module):
         C = rearrange(C, "b (h s) -> b h s", h=self.n_qk_heads)
 
         state["ssm"] = state["ssm"].to(x.dtype)
+        zeros = torch.zeros((self.n_v_heads, self.headdim), device=A_log.device).to(dtype=x.dtype)
         ones = torch.ones((self.n_v_heads, self.headdim, self.d_state), device=A_log.device).to(dtype=x.dtype)
         y = selective_state_update(
             x=x/F.softplus(A_log).to(x.dtype).unsqueeze(-1),
@@ -249,6 +250,8 @@ class Mixer(nn.Module):
             B=B,
             C=C,
             state=state["ssm"], # will be updated in place
+            dt_bias=zeros,
+            D=zeros,
         )
 
         y = y + self.D[:, None] * x
