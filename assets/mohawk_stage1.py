@@ -9,10 +9,6 @@ from modules.lm_head import LMHeadModel
 from modules.modeling_phi import PhiForCausalLM
 from utils.config import Config
 
-def initialize_weights(module):
-    if isinstance(module, torch.nn.Linear):
-        init.zeros_(module.weight)
-
 device = "cuda"
 
 teacher_model = PhiForCausalLM.from_pretrained(
@@ -23,9 +19,6 @@ teacher_model.requires_grad_(False)
 
 model_config = Config.from_json("assets/sample_config.json")
 student_model = LMHeadModel(model_config).to(device)
-
-# Basic initialization
-student_model.apply(initialize_weights)
 
 dataset = load_dataset("stas/openwebtext-10k")["train"]
 dataloader = DataLoader(dataset, batch_size=4)
@@ -60,9 +53,7 @@ for idx, data in enumerate(dataset):
             run_mlp_component=False,
             return_mixer_matrix=True,
         )
-        transfer_matrix = student_output["transfer_matrix"][
-            ..., :seq_len, :seq_len
-        ] # because of our Mamba2 chunking implementation
+        transfer_matrix = student_output["transfer_matrix"]
         attn_matrix = teacher_outputs.all_attn_matrices[layer_idx]
 
         assert transfer_matrix.size() == attn_matrix.size()

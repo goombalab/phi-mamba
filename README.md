@@ -138,9 +138,7 @@ student_output = student_layer(
     run_mlp_component=not freeze_mlp,
     return_hidden_states=not freeze_mlp
 )
-transfer_matrix = student_output["transfer_matrix"][
-    ..., :seq_len, :seq_len
-] # because of our Mamba2 chunking implementation
+transfer_matrix = student_output["transfer_matrix"]
 attn_matrix = teacher_outputs.all_attn_matrices[layer_idx]
 loss = torch.linalg.matrix_norm(
     transfer_matrix - attn_matrix, ord="fro"

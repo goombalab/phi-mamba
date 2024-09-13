@@ -200,7 +200,7 @@ class Mixer(nn.Module):
         if return_mixer_matrix:
             outputs["transfer_matrix"] = materialize_mixer(
                 A_log=A_log, B=B, C=C, D=self.D
-                )
+            )[..., :seqlen, :seqlen]
         return outputs
 
     def step(self, u, state, **kwargs):

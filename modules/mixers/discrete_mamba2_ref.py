@@ -126,7 +126,7 @@ def materialize_mixer(A_log, B, C, D):
     assert B.shape == C.shape == (batch_size, length, n_heads, d_state)
 
     # Compute:
-    A_log = rearrange(A_log, "b l h -> b h l")
+    A_log = rearrange(-F.softplus(A_log), "b l h -> b h l")
     powers = torch.exp(segsum(A_log))
     T = torch.einsum("blhn,bshn,bhls->bhsl", C, B, powers)
 
