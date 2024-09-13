@@ -11,11 +11,11 @@
 Phi-Mamba is a subquadratic, Mamba-based model distilled from Phi-1.5 using the MOHAWK method with only 3B tokens. MOHAWK allows cross-architectural distillation from Transformers by viewing Attention and, in this case, SSMs as sequence transformations that can be aligned. MOHAWK consists of three stages which gradually increase the scope of distillation: starting from each layer's matrix mixer, then to the hidden state of each layer, and finally the entire model. 
 
 ## Installation
-Installation instructions are heavily inspired by the original [state-spaces/mamba](https://github.com/state-spaces/mamba) repo. Note, `torch>=2.3` has seemed to give issues with the package, so please use `torch==2.2` for now
+Installation instructions are heavily inspired by the original [state-spaces/mamba](https://github.com/state-spaces/mamba) repo. Note, `torch>=2.2` has seemed to give issues with the package, so please use `torch==2.1` for now
 
-- [Optional] `pip install causal-conv1d==1.2.0post1`: an efficient implementation of a simple causal Conv1d layer used inside the Mamba block.
-- `pip install mamba-ssm==2.2.2`: the core Mamba package.
-- `pip install flash-attn==2.5.6`: only used for the hybrid Phi-Mamba model
+- [Optional] `pip install causal_conv1d==1.1.1`: an efficient implementation of a simple causal Conv1d layer used inside the Mamba block.
+- `pip install mamba-ssm`: the core Mamba package.
+- `pip install flash-attn==2.5.8`: only used for the hybrid Phi-Mamba model
 
 ## Usage
 
@@ -120,6 +120,60 @@ On Python 3.10 you might need to manually install the latest version of `prompts
 python lm_harness_eval.py --model phi-mamba --tasks lambada_openai,hellaswag,piqa,arc_easy,arc_challenge,winogrande --device cuda --batch_size 64
 ```
 
+## MOHAWK Stage 1 Example
+Stage 1 of MOHAWK matches the matrix mixer of both the student and the teacher. The code below shows how to ensure the teacher and student matrix mixer take the same input and how to match the their matrices. A more comprehensive example can be found in [./assets/mohawk_stage1.py](./assets/mohawk_stage1.py)
+
+```python
+layer_idx = 0
+teacher_outputs = teacher_model(
+    input_ids=input_ids,
+    output_hidden_states=True,
+    output_attention_results=True,
+    output_attentions=True,
+    use_cache=False
+)
+student_input = teacher_outputs.all_hidden_state[layer_idx]
+student_output = student_layer(
+    hidden_states=student_input,
+    run_mlp_component=not freeze_mlp,
+    return_hidden_states=not freeze_mlp
+)
+transfer_matrix = student_output["transfer_matrix"][
+    ..., :seq_len, :seq_len
+] # because of our Mamba2 chunking implementation
+attn_matrix = teacher_outputs.all_attn_matrices[layer_idx]
+loss = torch.linalg.matrix_norm(
+    transfer_matrix - attn_matrix, ord="fro"
+).mean()
+```
+
+## MOHAWK Stage 2 Example
+Stage 2 of MOHAWK matches the output of the student and teacher matrix mixer layers. The code belows shows how to do this. A more comprehensive example can be found in [./assets/mohawk_stage2.py](./assets/mohawk_stage2.py)
+
+```python
+freeze_mlp = True  # up to training scheme
+layer_idx = 0
+teacher_outputs = teacher_model(
+    input_ids=input_ids,
+    output_hidden_states=True,
+    use_cache=False,
+    output_attention_results=freeze_mlp
+)
+student_input = teacher_outputs.all_hidden_state[layer_idx]
+student_output = student_layer(
+    hidden_states=student_input,
+    run_mlp_component=not freeze_mlp,
+    return_hidden_states=not freeze_mlp
+)
+teacher_hstate = (
+    teacher_outputs.all_attn_outputs[layer_idx]
+    if freeze_mlp
+    else teacher_outputs.all_hidden_states[layer_idx + 1]
+)
+loss = torch.norm(
+    student_output["hidden_states"] - teacher_hstate, p=2, dim=(-1,)
+).mean()
+```
 ## Citation
 If you use this codebase, or otherwise find our work valuable, please cite Phi-Mamba:
 ```
